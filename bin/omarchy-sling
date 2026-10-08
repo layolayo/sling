@@ -197,6 +197,31 @@ def human_size(size):
     return "%.1f KB" % (size / 1024)
 
 
+def deduplicate_send_dir():
+    """Prunes broken symlinks and removes redundant duplicate symlinks in SEND_DIR."""
+    if not os.path.isdir(SEND_DIR):
+        return
+    seen_targets = {}
+    entries = sorted(os.listdir(SEND_DIR))
+    for item in entries:
+        item_path = os.path.join(SEND_DIR, item)
+        if os.path.islink(item_path) and not os.path.exists(item_path):
+            try:
+                os.remove(item_path)
+            except OSError:
+                pass
+            continue
+        try:
+            target = os.path.realpath(item_path)
+            if target in seen_targets:
+                if os.path.islink(item_path):
+                    os.remove(item_path)
+            else:
+                seen_targets[target] = item_path
+        except OSError:
+            pass
+
+
 def unique_path(directory, filename):
     dest = os.path.join(directory, filename)
     base, ext = os.path.splitext(filename)
@@ -210,11 +235,20 @@ def unique_path(directory, filename):
 def list_files(directory, limit=None):
     if not os.path.isdir(directory):
         return []
+    if directory == SEND_DIR:
+        deduplicate_send_dir()
     names = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
     names.sort(key=lambda f: os.path.getmtime(os.path.join(directory, f)), reverse=True)
     if limit:
         names = names[:limit]
-    return [{"name": f, "size": human_size(os.path.getsize(os.path.join(directory, f)))} for f in names]
+    res = []
+    for f in names:
+        p = os.path.join(directory, f)
+        try:
+            res.append({"name": f, "size": human_size(os.path.getsize(p))})
+        except OSError:
+            pass
+    return res
 
 
 def generate_qr(url):
@@ -300,7 +334,7 @@ def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=
             on_progress(nbytes, name)
 
     while remaining > 0:
-        chunk = rfile.read(min(65536, remaining))
+        chunk = rfile.read(min(262144, remaining))
         if not chunk:
             break
         remaining -= len(chunk)
@@ -554,8 +588,21 @@ class SlingHandler(BaseHTTPRequestHandler):
     server_version = "Sling/" + VERSION
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+        except OSError:
+            pass
+
     def log_message(self, fmt, *args):
-        pass
+        try:
+            client_ip = self.client_address[0] if hasattr(self, "client_address") else "-"
+            log("%s - %s" % (client_ip, fmt % args))
+        except Exception:
+            pass
 
     def _resolve(self):
         """Sökvägen efter token-prefixet, annars None (→ 403)."""
@@ -623,7 +670,7 @@ class SlingHandler(BaseHTTPRequestHandler):
                 start_transfer("down", name, size)
                 try:
                     with open(filepath, "rb") as fh:
-                        while chunk := fh.read(65536):
+                        while chunk := fh.read(262144):
                             self.wfile.write(chunk)
                             bump_transfer(len(chunk))
                 except (BrokenPipeError, ConnectionResetError):
@@ -632,6 +679,18 @@ class SlingHandler(BaseHTTPRequestHandler):
                     end_transfer()
             else:
                 self._send(404)
+
+        elif rest.startswith("/remove/"):
+            name = os.path.basename(urllib.parse.unquote(rest[len("/remove/"):]))
+            filepath = os.path.join(SEND_DIR, name)
+            if name and (os.path.islink(filepath) or os.path.isfile(filepath)):
+                try:
+                    os.remove(filepath)
+                    self._send(200, json.dumps({"ok": True, "removed": name}).encode(), "application/json")
+                except OSError as e:
+                    self._send(500, json.dumps({"ok": False, "error": str(e)}).encode(), "application/json")
+                return
+            self._send(404)
 
         else:
             self._send(404)
@@ -697,6 +756,7 @@ class SlingHandler(BaseHTTPRequestHandler):
 
 class SlingServer(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 64
 
     def server_bind(self):
         """Hoppar över BaseHTTPServer.server_bind, som gör en omvänd DNS-lookup
@@ -719,6 +779,7 @@ def status_dict(running=None):
         running = port_open()
     if running:
         generate_qr(server_url(token, ip))
+    deduplicate_send_dir()
     data = {
         "ok": True,
         "version": VERSION,
@@ -842,8 +903,9 @@ def cmd_status():
     return 0
 
 
-def cmd_open():
-    subprocess.run(["xdg-open", RECEIVED_DIR], check=False)
+def cmd_open(which=None):
+    folder = SEND_DIR if which and which.lower() in ("send", "skicka") else RECEIVED_DIR
+    subprocess.run(["xdg-open", folder], check=False)
     return 0
 
 
@@ -870,13 +932,45 @@ def cmd_copy(which=None):
 def cmd_send(paths):
     """Lägger filer i Send/. Symlänk i första hand — en 2 GB-video ska inte
     behöva finnas i två kopior för att kunna hämtas."""
+    deduplicate_send_dir()
     count = 0
     for raw in paths:
         src = os.path.abspath(os.path.expanduser(raw))
         if not os.path.isfile(src):
             print("hoppar över %s (ingen fil)" % src, file=sys.stderr)
             continue
-        dest = unique_path(SEND_DIR, os.path.basename(src))
+
+        # Kontrollera om denna fil redan finns i Send/-kön
+        already_dest = None
+        for item in os.listdir(SEND_DIR):
+            item_path = os.path.join(SEND_DIR, item)
+            try:
+                if os.path.realpath(item_path) == os.path.realpath(src) or (os.path.exists(item_path) and os.path.samefile(item_path, src)):
+                    already_dest = item_path
+                    break
+                if item == os.path.basename(src) and os.path.isfile(item_path) and os.path.getsize(item_path) == os.path.getsize(src):
+                    with open(item_path, "rb") as f1, open(src, "rb") as f2:
+                        if f1.read(65536) == f2.read(65536):
+                            already_dest = item_path
+                            break
+            except OSError:
+                continue
+
+        if already_dest:
+            print("%s (already in send queue)" % already_dest)
+            count += 1
+            continue
+
+        dest = os.path.join(SEND_DIR, os.path.basename(src))
+        if os.path.islink(dest) and not os.path.exists(dest):
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+
+        if os.path.exists(dest):
+            dest = unique_path(SEND_DIR, os.path.basename(src))
+
         try:
             os.symlink(src, dest)
         except OSError:
@@ -884,6 +978,64 @@ def cmd_send(paths):
         print(dest)
         count += 1
     return 0 if count else 1
+
+
+def cmd_remove(names):
+    """Tar bort filer från Send/-kön.
+    Accepterar filnamn i kön, sökväg till källfil, eller '--all'."""
+    if not names:
+        print("Usage: omarchy-sling remove <filename...> | --all", file=sys.stderr)
+        return 1
+
+    if "--all" in names:
+        return cmd_clear()
+
+    count = 0
+    for raw in names:
+        name = os.path.basename(raw)
+        target = os.path.join(SEND_DIR, name)
+        removed = False
+        if os.path.islink(target) or os.path.isfile(target):
+            try:
+                os.remove(target)
+                removed = True
+            except OSError as e:
+                print("Kunde inte ta bort %s: %s" % (name, e), file=sys.stderr)
+        else:
+            # Kontrollera om någon symlänk i Send/ pekar på denna fil
+            src = os.path.abspath(os.path.expanduser(raw))
+            for item in os.listdir(SEND_DIR):
+                item_path = os.path.join(SEND_DIR, item)
+                try:
+                    if os.path.realpath(item_path) == os.path.realpath(src) or (os.path.exists(item_path) and os.path.samefile(item_path, src)):
+                        os.remove(item_path)
+                        removed = True
+                        name = item
+                        break
+                except OSError:
+                    pass
+        if removed:
+            print("Removed from send queue: %s" % name)
+            count += 1
+        else:
+            print("Hittade inte %s i Send/" % name, file=sys.stderr)
+    return 0 if count else 1
+
+
+def cmd_clear():
+    """Rensar hela Send/-kön."""
+    count = 0
+    if os.path.isdir(SEND_DIR):
+        for item in os.listdir(SEND_DIR):
+            p = os.path.join(SEND_DIR, item)
+            try:
+                if os.path.islink(p) or os.path.isfile(p):
+                    os.remove(p)
+                    count += 1
+            except OSError:
+                pass
+    print("Cleared %d file(s) from send queue." % count)
+    return 0
 
 
 def cmd_send_pick():
@@ -1013,6 +1165,51 @@ def cmd_selftest():
         check("status-url bär token", token in st["url"], st["url"])
         check("QR-koden skapas (qrencode via stdin)", st["qr_ok"] is True)
         check("status har active-nyckeln (None när inget pågår)", st.get("active") is None, str(st.get("active")))
+
+        # Send-kö: verifiera dupliceringsskydd, borttagning och rensning
+        saved_send_dir = globals()["SEND_DIR"]
+        test_send_dir = os.path.join(tmp, "Send")
+        os.makedirs(test_send_dir, mode=0o700, exist_ok=True)
+        globals()["SEND_DIR"] = test_send_dir
+        try:
+            doc1 = os.path.join(tmp, "fil1.txt")
+            with open(doc1, "w") as fh:
+                fh.write("sling test data 1")
+            cmd_send([doc1])
+            send1 = os.path.join(test_send_dir, "fil1.txt")
+            check("skicka-kön köar ny fil", os.path.exists(send1))
+
+            # Lägg till samma fil igen
+            cmd_send([doc1])
+            send1_dup = os.path.join(test_send_dir, "fil1_1.txt")
+            check("samma fil ger ingen dubblett i Send/", not os.path.exists(send1_dup))
+
+            # Annan fil med samma namn
+            other_dir = os.path.join(tmp, "other")
+            os.makedirs(other_dir, exist_ok=True)
+            doc2 = os.path.join(other_dir, "fil1.txt")
+            with open(doc2, "w") as fh:
+                fh.write("annat innehåll")
+            cmd_send([doc2])
+            check("annan fil med samma namn får _1 i Send/", os.path.exists(send1_dup))
+
+            # Ta bort en fil via CLI
+            cmd_remove(["fil1.txt"])
+            check("ta bort enskild fil ur Send/", not os.path.exists(send1))
+            check("källfilen finns kvar oskadd efter borttagning", os.path.exists(doc1))
+
+            # HTTP remove
+            with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/remove/fil1_1.txt" % (port, token), timeout=5) as r:
+                rem_resp = json.loads(r.read())
+            check("HTTP remove svarar ok", rem_resp.get("ok") is True)
+            check("fil borttagen via HTTP", not os.path.exists(send1_dup))
+
+            # Rensa Send/-kön
+            cmd_send([doc1])
+            cmd_clear()
+            check("rensa hela Send/-kön", len(os.listdir(test_send_dir)) == 0)
+        finally:
+            globals()["SEND_DIR"] = saved_send_dir
 
         # Token får aldrig hamna i en process kommandorad (argv) — en annan lokal
         # användare kan läsa den ur processlistan. Provet fångar arg-versionen av
@@ -1166,9 +1363,13 @@ def main():
     elif action == "status":
         sys.exit(cmd_status())
     elif action == "open":
-        sys.exit(cmd_open())
+        sys.exit(cmd_open(sys.argv[2] if len(sys.argv) > 2 else None))
     elif action == "send":
         sys.exit(cmd_send(sys.argv[2:]))
+    elif action == "remove":
+        sys.exit(cmd_remove(sys.argv[2:]))
+    elif action == "clear":
+        sys.exit(cmd_clear())
     elif action == "copy":
         sys.exit(cmd_copy(sys.argv[2] if len(sys.argv) > 2 else None))
     elif action == "send-pick":
@@ -1176,7 +1377,7 @@ def main():
     elif action == "selftest":
         sys.exit(cmd_selftest())
     else:
-        print("Usage: omarchy-sling [server | start | stop | status | open | send <fil...> | send-pick | copy [mdns] | selftest]")
+        print("Usage: omarchy-sling [server | start | stop | status | open [send|received] | send <fil...> | remove <fil...> | clear | send-pick | copy [mdns] | selftest]")
         sys.exit(2)
 
 
